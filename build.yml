@@ -1,0 +1,252 @@
+name: Build APK
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Write project
+        run: |
+          D=app/src/main/java/com/hap/island
+          mkdir -p $D
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Hap"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+            id("com.android.application") version "8.5.2" apply false
+            id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          echo "org.gradle.jvmargs=-Xmx2048m" > gradle.properties
+          cat > app/build.gradle.kts <<'EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+            namespace = "com.hap.island"
+            compileSdk = 34
+            defaultConfig { applicationId = "com.hap.island"; minSdk = 26; targetSdk = 33; versionCode = 1; versionName = "1.0" }
+            compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+            kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+            <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+            <uses-permission android:name="android.permission.WRITE_SETTINGS"/>
+            <application android:label="Hap" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+              <service android:name=".PillService" android:exported="false"/>
+              <service android:name=".Listener" android:exported="true" android:label="Hap"
+                android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                <intent-filter><action android:name="android.service.notification.NotificationListenerService"/></intent-filter>
+              </service>
+            </application>
+          </manifest>
+          EOF
+          cat > $D/Listener.kt <<'EOF'
+          package com.hap.island
+          import android.service.notification.NotificationListenerService
+          class Listener : NotificationListenerService() {
+            override fun onListenerConnected() { inst = this }
+            override fun onListenerDisconnected() { inst = null }
+            companion object { var inst: Listener? = null }
+          }
+          EOF
+          cat > $D/MainActivity.kt <<'EOF'
+          package com.hap.island
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          class MainActivity : Activity() {
+            override fun onCreate(b: Bundle?) {
+              super.onCreate(b)
+              val l = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
+              fun btn(t: String, f: () -> Unit) = l.addView(Button(this).apply { text = t; setOnClickListener { f() } })
+              btn("1) Ekran üstü izni") { startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))) }
+              btn("2) Bildirim erişimi") { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }
+              btn("3) Parlaklık izni") { startActivity(Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:$packageName"))) }
+              btn("4) Pil kısıtlaması (Hap: kısıtlama yok)") { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
+              btn("5) Hapı başlat") { startForegroundService(Intent(this, PillService::class.java)) }
+              btn("Hapı durdur") { stopService(Intent(this, PillService::class.java)) }
+              setContentView(l)
+            }
+          }
+          EOF
+          cat > $D/PillService.kt <<'EOF'
+          package com.hap.island
+          import android.app.*
+          import android.content.*
+          import android.graphics.*
+          import android.graphics.drawable.GradientDrawable
+          import android.media.*
+          import android.media.session.*
+          import android.os.*
+          import android.provider.Settings
+          import android.service.notification.StatusBarNotification
+          import android.text.TextUtils
+          import android.view.*
+          import android.widget.*
+          class PillService : Service() {
+            private lateinit var wm: WindowManager
+            private lateinit var root: LinearLayout
+            private lateinit var lp: WindowManager.LayoutParams
+            private val h = Handler(Looper.getMainLooper())
+            private var open = false
+            private var sig = ""
+            private val tick = object : Runnable {
+              override fun run() {
+                val m = music()
+                val s = "$open|${m?.metadata?.getString(MediaMetadata.METADATA_KEY_TITLE)}|${m?.playbackState?.state}|${cargo()}"
+                if (s != sig) { sig = s; render() }
+                h.postDelayed(this, 1500)
+              }
+            }
+            override fun onBind(i: Intent?): IBinder? = null
+            override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+              getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("hap", "Hap", NotificationManager.IMPORTANCE_MIN))
+              startForeground(1, Notification.Builder(this, "hap").setContentTitle("Hap açık").setSmallIcon(android.R.drawable.ic_media_play).build())
+              if (!Settings.canDrawOverlays(this)) { stopSelf(); return START_NOT_STICKY }
+              if (!::root.isInitialized) setup()
+              return START_STICKY
+            }
+            override fun onDestroy() {
+              h.removeCallbacks(tick)
+              if (::root.isInitialized) { try { wm.removeView(root) } catch (e: Exception) {} }
+              super.onDestroy()
+            }
+            private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+            private fun setup() {
+              wm = getSystemService(WindowManager::class.java)
+              root = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                background = GradientDrawable().apply { setColor(Color.BLACK); cornerRadius = dp(18).toFloat() }
+                setPadding(dp(14), dp(5), dp(14), dp(5))
+              }
+              val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+                override fun onDown(e: MotionEvent) = true
+                override fun onDoubleTap(e: MotionEvent): Boolean { if (music() != null || cargo() != null) toggle(); return true }
+                override fun onSingleTapConfirmed(e: MotionEvent): Boolean { if (music() == null && cargo() == null) toggle(); return true }
+              })
+              root.setOnTouchListener { _, e -> gd.onTouchEvent(e); true }
+              lp = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT
+              ).apply { gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL; y = dp(6) }
+              wm.addView(root, lp)
+              tick.run()
+            }
+            private fun toggle() { open = !open; sig = ""; render() }
+            private fun music(): MediaController? = try {
+              val l = getSystemService(MediaSessionManager::class.java).getActiveSessions(ComponentName(this, Listener::class.java))
+              l.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING } ?: l.firstOrNull()
+            } catch (e: Exception) { null }
+            private fun txt(n: StatusBarNotification): String {
+              val x = n.notification.extras
+              return "${x.getCharSequence("android.title") ?: ""}\n${x.getCharSequence("android.text") ?: ""}"
+            }
+            private fun cargo(): String? = try {
+              Listener.inst?.activeNotifications
+                ?.filter { n -> listOf("trendyol", "hepsiburada", "mediamarkt").any { n.packageName.contains(it) } && Regex("kargo|sipariş|teslim|paket|kurye|dağıtım").containsMatchIn(txt(n).lowercase()) }
+                ?.maxByOrNull { it.postTime }?.let { txt(it) }
+            } catch (e: Exception) { null }
+            private fun label(t: String, sz: Float) = TextView(this).apply {
+              text = t; textSize = sz; setTextColor(Color.WHITE); gravity = Gravity.CENTER; maxLines = 1; ellipsize = TextUtils.TruncateAt.END
+            }
+            private fun btn(t: String, f: () -> Unit) = TextView(this).apply {
+              text = t; textSize = 24f; setTextColor(Color.WHITE); setPadding(dp(22), dp(4), dp(22), dp(4)); setOnClickListener { f() }
+            }
+            private fun bar(mx: Int, cur: Int, on: (Int) -> Unit) = SeekBar(this).apply {
+              max = mx; progress = cur
+              setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { if (u) on(p) }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+              })
+            }
+            private fun volume(): View {
+              val am = getSystemService(AudioManager::class.java)
+              return bar(am.getStreamMaxVolume(AudioManager.STREAM_MUSIC), am.getStreamVolume(AudioManager.STREAM_MUSIC)) { am.setStreamVolume(AudioManager.STREAM_MUSIC, it, 0) }
+            }
+            private fun bright(): View {
+              val ok = Settings.System.canWrite(this)
+              val cur = Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, 128)
+              return bar(255, cur) {
+                if (ok) {
+                  Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS_MODE, Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL)
+                  Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, it)
+                }
+              }
+            }
+            private fun render() {
+              root.removeAllViews()
+              val m = music()
+              val c = cargo()
+              val md = m?.metadata
+              val title = md?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: ""
+              if (!open) {
+                root.minimumWidth = 0
+                val t = if (m != null) "♪ $title" else if (c != null) "📦 Kargo" else ""
+                root.addView(label(t, 12f).apply { minWidth = dp(120); maxWidth = dp(240) })
+              } else {
+                root.minimumWidth = dp(330)
+                if (m != null) {
+                  val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                  val art = md?.getBitmap(MediaMetadata.METADATA_KEY_ART) ?: md?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+                  if (art != null) row.addView(ImageView(this).apply { setImageBitmap(art); scaleType = ImageView.ScaleType.CENTER_CROP }, LinearLayout.LayoutParams(dp(56), dp(56)).apply { rightMargin = dp(10) })
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  col.addView(label(title, 15f))
+                  col.addView(label(md?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: "", 12f))
+                  row.addView(col)
+                  root.addView(row)
+                  val playing = m.playbackState?.state == PlaybackState.STATE_PLAYING
+                  val ctl = LinearLayout(this).apply { gravity = Gravity.CENTER }
+                  ctl.addView(btn("⏮") { m.transportControls.skipToPrevious() })
+                  ctl.addView(btn(if (playing) "⏸" else "▶") { if (playing) m.transportControls.pause() else m.transportControls.play(); h.postDelayed({ render() }, 400) })
+                  ctl.addView(btn("⏭") { m.transportControls.skipToNext() })
+                  root.addView(ctl)
+                  root.addView(volume())
+                  if (c != null) root.addView(label("📦 $c", 12f).apply { maxLines = 3 })
+                } else if (c != null) {
+                  root.addView(label("📦 $c", 14f).apply { maxLines = 4 })
+                } else {
+                  root.addView(label("Ses", 12f))
+                  root.addView(volume())
+                  root.addView(label("Parlaklık", 12f))
+                  root.addView(bright())
+                }
+              }
+              try { wm.updateViewLayout(root, lp) } catch (e: Exception) {}
+            }
+          }
+          EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hap-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
